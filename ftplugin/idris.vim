@@ -6,6 +6,15 @@ if exists("b:did_ftplugin")
   finish
 endif
 
+if !has("job")
+  echo "Cannot load idris.vim without jobs"
+endif
+
+let b:client = job_start("idris --ide-mode")
+let b:channel = job_getchannel(b:client)
+let b:debug = 1
+let b:version = ch_readraw(b:channel)
+
 setlocal shiftwidth=2
 setlocal tabstop=2
 if !exists("g:idris_allow_tabchar") || g:idris_allow_tabchar == 0
@@ -31,9 +40,30 @@ function! s:currentQueryObject()
   return word
 endfunction
 
-function! s:IdrisCommand(...)
-  let idriscmd = shellescape(join(a:000))
-  return system("idris --client " . idriscmd)
+function! s:IdrisCommand(sexp)
+  let str = printf("(%s 1)\n", a:sexp)
+  let header = printf("%06x", len(str))
+
+  let msg = printf("%s%s", header, str)
+  if b:debug
+    echo printf("-> %s", msg)
+  endif
+
+  call ch_sendraw(b:channel, msg)
+endfunction
+
+function! s:IdrisResponse()
+  let responses = [Sexp(ch_read(b:channel)[6:])]
+
+  while responses[len(responses)-1][0] != ':return'
+    let responses = responses + [Sexp(ch_read(b:channel)[6:])]
+  endwhile
+  return responses
+endfunction
+
+function! s:IdrisReturn()
+  let response = s:IdrisResponse()
+  return response[len(response) - 1]
 endfunction
 
 function! IdrisDocFold(lineNum)
@@ -92,18 +122,23 @@ function! IWrite(str)
 endfunction
 
 function! IdrisReload(q)
-  w
+  silent w
+
   let file = expand("%:p")
-  let tc = s:IdrisCommand(":l", file)
-  if (! (tc is ""))
-    call IWrite(tc)
-  else
+
+  call s:IdrisCommand(printf("(:load-file \"%s\")", file))
+  let tc = s:IdrisReturn()
+
+  if tc[1][0] == ":ok"
     if (a:q==0)
        echo "Successfully reloaded " . file
        call IWrite("")
     endif
+  else
+    call IWrite(tc)
   endif
-  return tc
+
+  return ""
 endfunction
 
 function! IdrisReloadToLine(cline)
@@ -117,24 +152,54 @@ function! IdrisReloadToLine(cline)
   "return tc
 endfunction
 
+function! Sexp(str)
+  let str = a:str
+  let str = substitute(str, "(", " ( ", "g")
+  let str = substitute(str, ")", " ) ", "g")
+
+  return Parenthesize(split(str, '\s\+'), [])[0]
+endfunction
+
+function! Parenthesize(input, list)
+  if len(a:input) == 0
+    return a:list
+  endif
+
+  let token = remove(a:input, 0)
+
+  if token == "("
+    call add(a:list, Parenthesize(a:input, []))
+    return Parenthesize(a:input, a:list)
+  elseif token == ")"
+    return a:list
+  else
+    return Parenthesize(a:input, a:list + [token])
+  endif
+endfunction
+
 function! IdrisShowType()
-  w
+  silent w
+
   let word = s:currentQueryObject()
   let cline = line(".")
+
   let tc = IdrisReloadToLine(cline)
   if (! (tc is ""))
     echo tc
-  else
-    let ty = s:IdrisCommand(":t", word)
-    call IWrite(ty)
+    return tc
   endif
-  return tc
+
+  call s:IdrisCommand(printf("(:type-of \"%s\")", word))
+  echo s:IdrisResponse()
+  " echo s:IdrisReturn()
+
+  return
 endfunction
 
 function! IdrisShowDoc()
   w
   let word = expand("<cword>")
-  let ty = s:IdrisCommand(":doc", word)
+  let ty = s:IdrisCommand("docs-for", word)
   call IWrite(ty)
 endfunction
 
@@ -152,7 +217,7 @@ function! IdrisProofSearch(hint)
   endif
 
   if (tc is "")
-    let result = s:IdrisCommand(":ps!", cline, word, hints)
+    let result = s:IdrisCommand("proof-search", printf("%s %s %s", cline, word, hints))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -170,7 +235,7 @@ function! IdrisMakeLemma()
   let tc = IdrisReload(1)
 
   if (tc is "")
-    let result = s:IdrisCommand(":ml!", cline, word)
+    let result = s:IdrisCommand("make-lemma", printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -209,7 +274,7 @@ function! IdrisAddMissing()
   let tc = IdrisReload(1)
 
   if (tc is "")
-    let result = s:IdrisCommand(":am!", cline, word)
+    let result = s:IdrisCommand("add-missing", printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -226,7 +291,7 @@ function! IdrisCaseSplit()
   let tc = IdrisReloadToLine(cline)
 
   if (tc is "")
-    let result = s:IdrisCommand(":cs!", cline, word)
+    let result = s:IdrisCommand("case-split", printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -244,7 +309,7 @@ function! IdrisMakeWith()
   let tc = IdrisReload(1)
 
   if (tc is "")
-    let result = s:IdrisCommand(":mw!", cline, word)
+    let result = s:IdrisCommand("make-with", printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -263,7 +328,7 @@ function! IdrisMakeCase()
   let tc = IdrisReload(1)
 
   if (tc is "")
-    let result = s:IdrisCommand(":mc!", cline, word)
+    let result = s:IdrisCommand("make-case", printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -283,12 +348,12 @@ function! IdrisAddClause(proof)
 
   if (tc is "")
     if (a:proof==0)
-      let fn = ":ac!"
+      let fn = "add-clause"
     else
-      let fn = ":apc!"
+      let fn = "add-proof-clause"
     endif
 
-    let result = s:IdrisCommand(fn, cline, word)
+    let result = s:IdrisCommand(fn, printf("%s %s", cline, word))
     if (! (result is ""))
        call IWrite(result)
     else
@@ -300,15 +365,20 @@ function! IdrisAddClause(proof)
   endif
 endfunction
 
-function! IdrisEval()
-  w
-  let tc = IdrisReload(1)
-  if (tc is "")
-     let expr = input ("Expression: ")
-     let result = s:IdrisCommand(expr)
-     call IWrite(" = " . result)
-  endif
+function! IdrisVersion()
+  call s:IdrisCommand(":version")
+  echo s:IdrisResponse()
 endfunction
+
+" function! IdrisEval()
+"   w
+"   let tc = IdrisReload(1)
+"   if (tc is "")
+"      let expr = input ("Expression: ")
+"      let result = s:IdrisCommand(expr)
+"      call IWrite(" = " . result)
+"   endif
+" endfunction
 
 nnoremap <buffer> <silent> <LocalLeader>t :call IdrisShowType()<ENTER>
 nnoremap <buffer> <silent> <LocalLeader>r :call IdrisReload(0)<ENTER>
@@ -326,6 +396,7 @@ nnoremap <buffer> <silent> <LocalLeader>w 0:call IdrisMakeWith()<ENTER>
 nnoremap <buffer> <silent> <LocalLeader>mc :call IdrisMakeCase()<ENTER>
 nnoremap <buffer> <silent> <LocalLeader>i 0:call IdrisResponseWin()<ENTER>
 nnoremap <buffer> <silent> <LocalLeader>h :call IdrisShowDoc()<ENTER>
+nnoremap <buffer> <silent> <LocalLeader>v :call IdrisVersion()<ENTER>
 
 menu Idris.Reload <LocalLeader>r
 menu Idris.Show\ Type <LocalLeader>t
